@@ -28,6 +28,8 @@
 #include "hw/eos/eos_utils.h"
 #include "hw/eos/eos_bufcon_100D.h"
 #include "hw/eos/engine.h"
+#include <ft2build.h>
+#include FT_FREETYPE_H
 
 #define IGNORE_CONNECT_POLL
 
@@ -37,6 +39,9 @@
 
 static void eos_init_common(void);
 static void *eos_init_cpu(void);
+static bool eos_5d4_scanout_active;
+static uint32_t eos_5d4_scanout[960 * 540];
+static bool eos_5d4_scanout_valid;
 
 #define TYPE_EOS "eos"
 
@@ -1086,6 +1091,12 @@ static void eos_interrupt_timer_body(void)
 
 static void eos_interrupt_timer_cb(void *parm)
 {
+    static unsigned int lcd_refresh_ticks;
+    if (eos_5d4_scanout_active && ++lcd_refresh_ticks >= 64)
+    {
+        lcd_refresh_ticks = 0;
+        eos_trigger_int(0x86, 1);
+    }
     eos_interrupt_timer_body();
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     timer_mod_anticipate_ns(eos_state->interrupt_timer, now + DIGIC_TIMER_STEP*1000); // DIGIC_TIMER_STEP us
@@ -1495,6 +1506,26 @@ static void eos_update_display(void *parm)
     EOSState *s = (EOSState *)parm;
 
     DisplaySurface *surface = qemu_console_surface(s->disp.con);
+    if (!strcmp(s->model->name, MODEL_NAME_5D4))
+    {
+        /* 1.3.3 MARV LCD surface, ARGB8888, 960 pixels per row. */
+        if (surface_width(surface) != 960 || surface_height(surface) != 540)
+        {
+            qemu_console_resize(s->disp.con, 960, 540);
+            surface = qemu_console_surface(s->disp.con);
+        }
+        for (unsigned int y = 0; y < 540; y++)
+        {
+            if (eos_5d4_scanout_valid)
+                memcpy(surface_data(surface) + y * surface_stride(surface),
+                       &eos_5d4_scanout[y * 960], 960 * 4);
+            else
+                eos_mem_read(0x03911D00 + y * 960 * 4,
+                             surface_data(surface) + y * surface_stride(surface), 960 * 4);
+        }
+        dpy_gfx_update(s->disp.con, 0, 0, 960, 540);
+        return;
+    }
     
     // these numbers need double-checking
     //                  LCD    HDMI-1080   HDMI-480    SD-PAL      SD-NTSC
@@ -7090,8 +7121,170 @@ unsigned int eos_handle_digic6(unsigned int parm, unsigned int address, unsigned
                         /* MZRM channel 2: mark ring buffer consumed (0xBFF00410 -> 0xBFF00428) */
                         uint32_t wr_ptr = 0;
                         uint32_t rd_ptr = 0;
+                        static unsigned int zico_trace_count;
                         eos_mem_read(0xBFF00410, &wr_ptr, 4);
                         eos_mem_read(0xBFF00428, &rd_ptr, 4);
+                        /* Firmware 1.3.3 serializes the current MZRM packet here.
+                         * C0 supplies the ARGB palette; DF fills a clipped MARV surface. */
+                        if (wr_ptr != rd_ptr)
+                        {
+                            static uint32_t palette[256];
+                            uint32_t command[3];
+                            eos_mem_read(0xBFF00500, command, sizeof(command));
+                            if (command[0] == 0x24 && command[2] == 0x43C)
+                            {
+                                /* Ximr composition consumes the GUI layer before ARM
+                                 * reuses its working surface for the next update. */
+                                eos_mem_read(0x03911D00, eos_5d4_scanout,
+                                             sizeof(eos_5d4_scanout));
+                                eos_5d4_scanout_valid = true;
+                            }
+                            if (qemu_loglevel_mask(EOS_LOG_VERBOSE))
+                            {
+                                uint32_t title[320];
+                                unsigned int nonzero = 0;
+                                eos_mem_read(0x03911D00 + (75 * 960 + 170) * 4,
+                                             title, sizeof(title));
+                                for (unsigned int i = 0; i < ARRAY_SIZE(title); i++)
+                                    nonzero += (title[i] & 0xFFFFFF) != 0;
+                                fprintf(stderr, "[5D4 surface] cmd=%x title_pixels=%u\n", command[0], nonzero);
+                            }
+                            /* LCD display-completion ISR registered at FE0E189A.
+                             * A completed graphics batch must advance the scanout callbacks. */
+                            if (command[0] == 0x7D)
+                            {
+                                eos_5d4_scanout_active = true;
+                                eos_trigger_int(0x86, 100);
+                            }
+                            if (command[0] == 0x40 && command[2] >= 0x3C && command[2] <= 0x100)
+                            {
+                                static FT_Library library;
+                                static FT_Face face;
+                                static uint8_t *font;
+                                uint32_t p[64] = {0};
+                                eos_mem_read(0xBFF0050C, p, command[2]);
+                                if (!font && !FT_Init_FreeType(&library))
+                                {
+                                    font = g_malloc(0x2D9EC);
+                                    eos_mem_read(0xFDED6DC8, font, 0x2D9EC);
+                                    if (FT_New_Memory_Face(library, font, 0x2D9EC, 0, &face))
+                                        face = NULL;
+                                }
+                                uint32_t surface[7];
+                                if (p[0] >= 0xBFF0050C && p[0] <= 0xBFF00600)
+                                {
+                                    eos_mem_read(p[0], surface, sizeof(surface));
+                                    if (face && surface[0] == 0x5652414D && surface[4] == 960 &&
+                                        surface[5] == 540 && surface[1] >= 0x03900000 &&
+                                        surface[1] < 0x03B00000)
+                                    {
+                                        FT_Set_Pixel_Sizes(face, 0, 32);
+                                        int pen = p[1] >> 16;
+                                        int top = p[2] >> 16;
+                                        const unsigned char *text = (void *)&p[7];
+                                        unsigned int limit = MIN(command[2] - 28, p[0] - 0xBFF00528);
+                                        for (unsigned int c = 0; c < limit && text[c]; c++)
+                                        {
+                                            if (text[c] >= 128 || FT_Load_Char(face, text[c], FT_LOAD_RENDER))
+                                                continue;
+                                            FT_GlyphSlot g = face->glyph;
+                                            for (unsigned int y = 0; y < g->bitmap.rows; y++)
+                                                for (unsigned int x = 0; x < g->bitmap.width; x++)
+                                                {
+                                                    int dx = pen + g->bitmap_left + x;
+                                                    int dy = top + 32 - g->bitmap_top + y;
+                                                    unsigned int a = g->bitmap.buffer[y * g->bitmap.pitch + x];
+                                                    if (a && dx >= 0 && dx < 960 && dy >= 0 && dy < 540)
+                                                    {
+                                                        uint32_t color;
+                                                        hwaddr addr = surface[1] + (dy * 960 + dx) * 4;
+                                                        eos_mem_read(addr, &color, 4);
+                                                        uint32_t blended = 0xFF000000;
+                                                        for (int shift = 0; shift < 24; shift += 8)
+                                                            blended |= (((255 * a + ((color >> shift) & 255) * (255 - a)) / 255) << shift);
+                                                        eos_mem_write(addr, &blended, 4);
+                                                    }
+                                                }
+                                            pen += g->advance.x >> 6;
+                                        }
+                                    }
+                                }
+                            }
+                            if (command[0] == 0xC0 && command[2] == 0x404)
+                            {
+                                eos_mem_read(0xBFF00510, palette, sizeof(palette));
+                            }
+                            if (command[0] == 0xDF && command[2] == 0x48)
+                            {
+                                uint32_t p[18];
+                                eos_mem_read(0xBFF0050C, p, sizeof(p));
+                                if (p[11] == 0x5652414D && p[15] == 960 && p[16] == 540 &&
+                                    p[12] >= 0x03900000 && p[12] < 0x03B00000)
+                                {
+                                    unsigned int x0 = MIN(p[2], p[15]);
+                                    unsigned int y0 = MIN(p[3], p[16]);
+                                    unsigned int x1 = x0 + MIN(p[4], p[15] - x0);
+                                    unsigned int y1 = y0 + MIN(p[5], p[16] - y0);
+                                    /* DF carries an explicit clipping rectangle. Redraws
+                                     * clear a large area through a small invalidated region. */
+                                    x1 = MIN(x1, MIN(p[7], p[15]) + MIN(p[9], p[15] - MIN(p[7], p[15])));
+                                    y1 = MIN(y1, MIN(p[8], p[16]) + MIN(p[10], p[16] - MIN(p[8], p[16])));
+                                    x0 = MAX(x0, MIN(p[7], p[15]));
+                                    y0 = MAX(y0, MIN(p[8], p[16]));
+                                    x1 = MAX(x0, x1);
+                                    y1 = MAX(y0, y1);
+                                    uint32_t row[960];
+                                    for (unsigned int x = x0; x < x1; x++)
+                                        row[x - x0] = palette[p[6] & 255];
+                                    for (unsigned int y = y0; y < y1; y++)
+                                        eos_mem_write(p[12] + (y * p[15] + x0) * 4,
+                                                      row, (x1 - x0) * 4);
+                                }
+                            }
+                            /* E4 copies a monochrome ROM mask (rounded control corners). */
+                            if (command[0] == 0xE4 && command[2] == 0x50)
+                            {
+                                uint32_t p[20];
+                                eos_mem_read(0xBFF0050C, p, sizeof(p));
+                                if (p[13] == 0x5652414D && p[17] == 960 && p[18] == 540 &&
+                                    p[14] >= 0x03900000 && p[14] < 0x03B00000 &&
+                                    p[5] <= 64 && p[6] <= 64 && p[2] < 960 && p[3] < 540 &&
+                                    p[4] >= 0xFC000000)
+                                {
+                                    unsigned int pitch = (p[5] + 7) / 8;
+                                    uint8_t mask[512];
+                                    eos_mem_read(p[4], mask, pitch * p[6]);
+                                    for (unsigned int y = 0; y < p[6] && p[3] + y < 540; y++)
+                                        for (unsigned int x = 0; x < p[5] && p[2] + x < 960; x++)
+                                            if (mask[y * pitch + x / 8] & (0x80 >> (x & 7)))
+                                                eos_mem_write(p[14] + ((p[3] + y) * 960 + p[2] + x) * 4,
+                                                              &palette[p[7] & 255], 4);
+                                }
+                            }
+                        }
+                        if (qemu_loglevel_mask(EOS_LOG_VERBOSE) &&
+                            zico_trace_count < 4096 && wr_ptr != rd_ptr)
+                        {
+                            uint32_t descriptor[4];
+                            uint32_t packet[4];
+                            eos_mem_read(0xBFF00440, descriptor, sizeof(descriptor));
+                            eos_mem_read(0xBFF00500, packet, sizeof(packet));
+                            fprintf(stderr,
+                                    "[5D4 Zico] rd=%u wr=%u descriptor=%08x,%08x,%08x,%08x packet=%08x,%08x,%08x,%08x\n",
+                                    rd_ptr, wr_ptr,
+                                    descriptor[0], descriptor[1], descriptor[2], descriptor[3],
+                                    packet[0], packet[1], packet[2], packet[3]);
+                            zico_trace_count++;
+                            uint32_t payload[64];
+                            unsigned int bytes = MIN(packet[2], sizeof(payload));
+                            eos_mem_read(0xBFF0050C, payload, bytes);
+                            fprintf(stderr, "[5D4 Zico] payload");
+                            for (unsigned int i = 0; i < bytes / 4; i++)
+                            {
+                                fprintf(stderr, " %08x", payload[i]);
+                            }
+                            fprintf(stderr, "\n");
+                        }
                         eos_mem_write(0xBFF00428, &wr_ptr, 4);
                     }
                     zico_irq_status |= value;
