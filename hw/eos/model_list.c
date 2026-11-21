@@ -525,21 +525,27 @@ struct eos_model_desc eos_model_list[] = {
         .name                   = MODEL_NAME_5D4,
         .digic_version          = 6,
         .ram_size               = 0x40000000,   /* 1GB */
-//        .ram_manufacturer_id    = 0x18000401, // early 5D4 roms
-        .ram_manufacturer_id    = 0x18000103,   /* RAM manufacturer: Micron */
+        .ram_manufacturer_id    = 0x18000401, // 5D4 1.3.3 expects MR05=0x01
+//        .ram_manufacturer_id    = 0x18000103,   /* RAM manufacturer: Micron */
         .card_led_address       = 0xD20B0224,
         .current_task_addr      = 0x45A4,
         .mpu_request_register   = 0xD20B02A4,   /* written in mpu_send (run with -d io) */
         .mpu_status_register    = 0xD20B22A4,   /* read in SIO3_ISR and MREQ_ISR (tst 0x10000) */
         .mpu_control_register   = 0xD4013048,   /* 0x1C written in MREQ_ISR */
         .mpu_mreq_interrupt     = 0x12A,        /* MREQ_ISR in InitializeIntercom */
+        .rtc_time_correct       = 0x9E,         /* 5D4 1.3.3 correction register */
+        .rtc_control_reg_2      = 0x20,
         .serial_flash_size      = 0x1000000,
+        .ram_extra_addr[0]      = 0xBFE00000,   /* Omar and Zico shared memory and IPC rings */
+        .ram_extra_size[0]      = 0x00200000,
         .serial_flash_sio_ch    = 0,
         .serial_flash_interrupt = 0x10E,
         .serial_flash_cs_register = 0xD20B037C,
         .imgpowdet_register     = 0xD20B2294,   /* Image Power Failure */
         .imgpowdet_register_bit = 0x00010000,   /* register and bit checked to print that message */
         .imgpowdet_interrupt    = 0x10A,        /* interrupt registered when powering on the sensor */
+        .ram_extra_addr[1]      = 0x82000000,   /* 5D4 copies 0x10FEB0 bytes here from 0xFEBAD0F0 */
+        .ram_extra_size[1]      = 0x00200000,
     },
     {
         .name                   = MODEL_NAME_5D4AE,

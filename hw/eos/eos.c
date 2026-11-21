@@ -668,7 +668,7 @@ EOSRegionHandler eos_handlers[] =
   //{ "XDMAC8",       0xC9200D40, 0xC9200D7F, eos_handle_xdmac8, 1 },
   //{ "XDMAC8",       0xC9200D80, 0xC9200DBF, eos_handle_xdmac8, 2 },
 
-    { "MEMDIV",       0xD9001600, 0xD900FFFF, eos_handle_memdiv, 0 },
+    { "MEMDIV",       0xD9000000, 0xD900FFFF, eos_handle_memdiv, 0 },
 
     { "ROMID",        0xBFE01FD0, 0xBFE01FDF, eos_handle_rom_id, 0 },
     { "ROMID",        0xD5100010, 0xD5100010, eos_handle_rom_id, 1 },
@@ -2550,6 +2550,121 @@ unsigned int eos_handle_digicX(unsigned int parm, unsigned int address, unsigned
         }
         msg = "R6 GPIO?";
         ret = 0;
+    }
+
+    if (strcmp(eos_state->model->name, MODEL_NAME_5D4) == 0 &&
+        address >= 0xD2000000 && address <= 0xD20004FF)
+    {
+        /* 5D4 Omar/Marius IPC channels (0x000..0x1FF) + Postman semaphores (0x200..0x4FF) */
+        static uint32_t tx_buf[4][2];
+        static int tx_idx[4];
+        static uint32_t rx_fifo[4][64];
+        static int rx_head[4], rx_tail[4], rx_count[4];
+        static uint32_t sem_irq_en[8];
+        static uint32_t sem_irq_status;
+
+        if (address <= 0xD20001FF)
+        {
+            unsigned int ch = (address - 0xD2000000) >> 6;
+            unsigned int reg = address & 0x3F;
+            unsigned int pair = ch >> 1;
+
+            if ((ch & 1) == 0)
+            {
+                /* Even channel: TX to coprocessor */
+                if (reg == 0x04 && (type & MODE_WRITE))
+                {
+                    msg = "Omar IPC TX";
+                    tx_buf[pair][tx_idx[pair]++] = value;
+                    if (tx_idx[pair] == 2)
+                    {
+                        tx_idx[pair] = 0;
+                        eos_trigger_int(0x0D + (ch << 4), 0);
+                        if ((ch == 0 || ch == 2) && tx_buf[pair][1] >= 0x1000)
+                        {
+                            uint32_t hdr = 0;
+                            eos_mem_read(tx_buf[pair][1] - 4, &hdr, 4);
+                            if ((hdr & 0xFF0000FFu) == 0x01000001u)
+                            {
+                                uint8_t zero = 0;
+                                eos_mem_write(tx_buf[pair][1] - 4, &zero, 1);
+                            }
+                        }
+                        if (ch != 2 && rx_count[pair] <= 62)
+                        {
+                            rx_fifo[pair][rx_tail[pair]] = (ch == 4) ? (tx_buf[pair][0] & ~0xFFu) : tx_buf[pair][0];
+                            rx_tail[pair] = (rx_tail[pair] + 1) & 63;
+                            rx_fifo[pair][rx_tail[pair]] = tx_buf[pair][1];
+                            rx_tail[pair] = (rx_tail[pair] + 1) & 63;
+                            rx_count[pair] += 2;
+                            eos_trigger_int(0x0C + ((ch + 1) << 4), 1);
+                        }
+                    }
+                }
+                else if (reg == 0x00 && !(type & MODE_WRITE))
+                {
+                    msg = "Omar IPC TX count";
+                    ret = 0;
+                }
+            }
+            else
+            {
+                /* Odd channel: RX from coprocessor */
+                if (reg == 0x00 && !(type & MODE_WRITE))
+                {
+                    msg = "Omar IPC RX count";
+                    ret = rx_count[pair];
+                }
+                else if (reg == 0x14 && !(type & MODE_WRITE))
+                {
+                    msg = "Omar IPC RX data";
+                    if (rx_count[pair] > 0)
+                    {
+                        ret = rx_fifo[pair][rx_head[pair]];
+                        rx_head[pair] = (rx_head[pair] + 1) & 63;
+                        rx_count[pair]--;
+                    }
+                }
+            }
+        }
+        else if (address < 0xD2000400)
+        {
+            unsigned int sem = (address - 0xD2000200) >> 6;
+            unsigned int reg = address & 0x3F;
+            if (sem < 8)
+            {
+                if (reg == 0x08 && (type & MODE_WRITE))
+                {
+                    msg = "Postman sem IRQ en";
+                    sem_irq_en[sem] = value;
+                }
+                else if (reg == 0x00 && !(type & MODE_WRITE))
+                {
+                    msg = "Postman sem lock";
+                    ret = 0;
+                    if (sem_irq_en[sem])
+                    {
+                        sem_irq_status |= (1u << sem);
+                        eos_trigger_int(0x8D, 0);
+                    }
+                }
+            }
+        }
+        else if (address == 0xD2000400)
+        {
+            msg = "Postman sem IRQ status";
+            if (type & MODE_WRITE)
+            {
+                sem_irq_status &= value;
+            }
+            else
+            {
+                ret = sem_irq_status;
+            }
+        }
+
+        io_log("OMAR_IPC", address, type, value, ret, msg, 0, 0);
+        return ret;
     }
 
     switch (address)
@@ -6920,36 +7035,246 @@ unsigned int eos_handle_digic6(unsigned int parm, unsigned int address, unsigned
             ret = 0x10000;
             break;
 
-        case 0xD6040000:                /* M3: appears to expect 0x3008000 or 0x3108000 */
-            ret = 0x3008000;
+        case 0xD20B2318:                /* 5D4: RTCMgr polling bit 16 */
+            msg = "RTC ready?";
+            ret = 0x10000;
+            break;
+
+        case 0xD20B22DC:                /* 5D4: HDMI hotplug detect (0 = connected, 0x10000 = disconnected) */
+        case 0xD20B22F4:                /* 5D4: HeadPhone detect (0 = connected, 0x10000 = disconnected) */
+        case 0xD20B2134:                /* 5D4: MIC detect (0 = connected, 0x10000 = disconnected) */
+            msg = "HotPlug detect (disconnected)";
+            ret = 0x10000;
+            break;
+
+        case 0xD20F0110:                /* 5D4: Omar/Marius coprocessor boot */
+            msg = "Omar boot";
+            if ((type & MODE_WRITE) && value == 3 &&
+                strcmp(eos_state->model->name, MODEL_NAME_5D4) == 0)
+            {
+                eos_trigger_int(0x9C, 1);
+            }
+            break;
+
+        case 0xD20F0120:                /* 5D4: Zico graphics coprocessor boot */
+        case 0xD20F0814:                /* 5D4: Zico->ARM IPC IRQ clear */
+        case 0xD20F0818:                /* 5D4: Zico->ARM IPC IRQ status */
+        case 0xD20F0840:                /* 5D4: ARM->Zico IPC doorbell */
+            if (strcmp(eos_state->model->name, MODEL_NAME_5D4) == 0)
+            {
+                static uint32_t zico_irq_status = 0;
+                if (address == 0xD20F0120)
+                {
+                    msg = "5D4 Zico boot";
+                    if ((type & MODE_WRITE) && value == 2)
+                    {
+                        zico_irq_status |= 0x4;
+                        eos_trigger_int(0x19A, 5);
+                    }
+                }
+                else if (address == 0xD20F0814 && (type & MODE_WRITE))
+                {
+                    msg = "5D4 Zico IRQ clear";
+                    zico_irq_status &= ~value;
+                }
+                else if (address == 0xD20F0818 && !(type & MODE_WRITE))
+                {
+                    msg = "5D4 Zico IRQ status";
+                    ret = zico_irq_status;
+                }
+                else if (address == 0xD20F0840 && (type & MODE_WRITE))
+                {
+                    msg = "5D4 Zico IPC kick";
+                    if (value & 0x4)
+                    {
+                        /* MZRM channel 2: mark ring buffer consumed (0xBFF00410 -> 0xBFF00428) */
+                        uint32_t wr_ptr = 0;
+                        uint32_t rd_ptr = 0;
+                        eos_mem_read(0xBFF00410, &wr_ptr, 4);
+                        eos_mem_read(0xBFF00428, &rd_ptr, 4);
+                        eos_mem_write(0xBFF00428, &wr_ptr, 4);
+                    }
+                    zico_irq_status |= value;
+                    eos_trigger_int(0x19A, 1);
+                }
+            }
+            break;
+
+        case 0xD0100000:
+        case 0xD0110000:
+        case 0xD0120000:
+            if (strcmp(eos_state->model->name, MODEL_NAME_5D4) == 0)
+            {
+                msg = "5D4 JpCore status";
+                if ((type & MODE_WRITE) && (value & 1))
+                {
+                    unsigned int core = (address - 0xD0100000) >> 16;
+                    eos_trigger_int(0x133 + (core << 4), 1);
+                }
+                else
+                {
+                    ret = 0x01000000;
+                }
+            }
+            break;
+
+        case 0xD0100030:
+        case 0xD0110030:
+        case 0xD0120030:
+            if (strcmp(eos_state->model->name, MODEL_NAME_5D4) == 0)
+            {
+                msg = "5D4 JpCore selftest";
+                ret = 0x1FF;
+            }
+            break;
+
+        case 0xD0100044:
+        case 0xD0110044:
+        case 0xD0120044:
+            if (strcmp(eos_state->model->name, MODEL_NAME_5D4) == 0)
+            {
+                msg = "5D4 JpCore IRQ status";
+                ret = 0x400;
+            }
+            break;
+
+        case 0xD206C240:
+        case 0xD8000010:
+            if (strcmp(eos_state->model->name, MODEL_NAME_5D4) == 0 && (type & MODE_WRITE))
+            {
+                static int audio_tmr3_en = 0;
+                if (address == 0xD206C240)
+                {
+                    msg = "5D4 Audio Timer 3";
+                    audio_tmr3_en = (value == 0);
+                    if (audio_tmr3_en)
+                    {
+                        eos_trigger_int(0x37, 20);
+                    }
+                }
+                else
+                {
+                    msg = "5D4 Audio DSP cmd";
+                    if (audio_tmr3_en)
+                    {
+                        eos_trigger_int(0x37, 5);
+                    }
+                }
+            }
+            break;
+
+        case 0xD6040000 ... 0xD6040014:
+        case 0xD6050000 ... 0xD6050014:
+            if (strcmp(eos_state->model->name, MODEL_NAME_5D4) == 0)
+            {
+                unsigned int ch = (address >> 16) & 1;
+                unsigned int reg = address & 0x1F;
+                static uint32_t i2c_status[2] = { 0x20000, 0x20000 };
+                static uint32_t i2c_rx_cnt[2] = { 0, 0 };
+                unsigned int tcmp_irq = ch ? 0x10D : 0xDD;
+                unsigned int stop_irq = ch ? 0x12D : 0xFD;
+
+                if (reg == 0x00)
+                {
+                    if (type & MODE_WRITE)
+                    {
+                        msg = "5D4 I2C ctrl";
+                        if (value == 0x30008C80)
+                        {
+                            i2c_status[ch] = 0x03108100;
+                            eos_trigger_int(tcmp_irq, 1);
+                        }
+                        else if (value == 0x3000F480)
+                        {
+                            i2c_status[ch] = 0x03048100;
+                            eos_trigger_int(tcmp_irq, 1);
+                        }
+                        else if (value == 0x3000B480 || value == 0x3000BC80)
+                        {
+                            i2c_status[ch] = 0x03008100;
+                            eos_trigger_int(tcmp_irq, 1);
+                        }
+                        else if (value == 0x20000880)
+                        {
+                            i2c_status[ch] = 0x03020000;
+                            eos_trigger_int(stop_irq, 1);
+                        }
+                        else if (value == 0x20001880)
+                        {
+                            i2c_status[ch] = 0x03420000;
+                            eos_trigger_int(stop_irq, 1);
+                        }
+                        else if (value == 0x20008980 || value == 0x20009980)
+                        {
+                            /* ISR ack: keep status bits 15 & 8 for read start check */
+                        }
+                        else
+                        {
+                            i2c_status[ch] = (value & 0x8000) ? 0x2100100 : 0x20000;
+                        }
+                    }
+                    else
+                    {
+                        msg = "5D4 I2C status";
+                        ret = i2c_status[ch];
+                    }
+                }
+                else if (reg == 0x04)
+                {
+                    msg = "5D4 I2C data";
+                    if ((type & MODE_WRITE) && value == 0x10)
+                    {
+                        i2c_rx_cnt[ch]++;
+                    }
+                    else
+                    {
+                        ret = 0;
+                    }
+                }
+                else if (reg == 0x0C && (type & MODE_WRITE))
+                {
+                    if (value & 0x80000000)
+                    {
+                        i2c_rx_cnt[ch] = 0;
+                    }
+                }
+                else if (reg == 0x10 && !(type & MODE_WRITE))
+                {
+                    msg = "5D4 I2C FIFO count";
+                    ret = i2c_rx_cnt[ch] << 24;
+                }
+                break;
+            }
+            if (address == 0xD6040000)
+            {
+                ret = 0x3008000;
+            }
+            else if (address == 0xD6050000)
+            {
+                static int last = 0;
+                if(type & MODE_WRITE)
+                {
+                    last = value;
+                }
+                else
+                {
+                    msg = "I2C status?";
+                    if (strcmp(eos_state->model->name, MODEL_NAME_EOSM10) == 0)
+                    {
+                        ret = rand();
+                    }
+                    else
+                    {
+                        ret = (last & 0x8000) ? 0x2100100 : 0x20000;
+                    }
+                }
+            }
             break;
 
         case 0xD5202018:                /* M5: expects 1 at 0xE0009E9C */
         case 0xD5203018:                /* M5: expects 1 at 0xE0009EBA */
             ret = 1;
             break;
-
-        case 0xD6050000:
-        {
-            static int last = 0;
-            if(type & MODE_WRITE)
-            {
-                last = value;
-            }
-            else
-            {
-                msg = "I2C status?";
-                if (strcmp(eos_state->model->name, MODEL_NAME_EOSM10) == 0)
-                {
-                    ret = rand();
-                }
-                else
-                {
-                    ret = (last & 0x8000) ? 0x2100100 : 0x20000;
-                }
-            }
-            break;
-        }
 
         case 0xD6060000:
             msg = "E-FUSE";
@@ -7041,6 +7366,45 @@ unsigned int eos_handle_digic6(unsigned int parm, unsigned int address, unsigned
             msg = "M50 SD detect";
             ret = 0;
             //~ ret = 0x10000;
+    }
+
+    if (strcmp(eos_state->model->name, MODEL_NAME_5D4) == 0 &&
+        address >= 0xD9840000 && address <= 0xD9840FFF)
+    {
+        /* 5D4 CSIO / RTC SPI controller (4 channels at +0x200 + ch*0x400, IRQ 0xB8) */
+        static uint32_t csio_ram[0x200 / 4];
+        static uint32_t csio_status[4];
+
+        if (address < 0xD9840200)
+        {
+            msg = "5D4 CSIO RAM";
+            MMIO_VAR(csio_ram[(address - 0xD9840000) >> 2]);
+            if (address == 0xD98401C3 && !(type & MODE_WRITE))
+            {
+                uint8_t command = csio_ram[0x1c0 / 4] >> 24;
+                if ((command & 0x0f) == 0x0c)
+                    ret = eos_state->rtc.regs[command >> 4];
+            }
+        }
+        else if ((address & 0x3FF) == 0x204 && (type & MODE_WRITE))
+        {
+            unsigned int ch = (address - 0xD9840200) >> 10;
+            msg = "5D4 CSIO start";
+            if (ch < 4)
+            {
+                csio_status[ch] |= 0x1000;
+                eos_trigger_int(0xB8, 0);
+            }
+        }
+        else if ((address & 0x3FF) == 0x208)
+        {
+            unsigned int ch = (address - 0xD9840200) >> 10;
+            msg = "5D4 CSIO status";
+            if (ch < 4)
+            {
+                MMIO_VAR(csio_status[ch]);
+            }
+        }
     }
 
     if (address >= 0xD0130000 && address <= 0xD0130FFF) {
