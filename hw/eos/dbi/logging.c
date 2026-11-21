@@ -1623,6 +1623,13 @@ static void eos_tasks_log_exec(CPUState *cpu, TranslationBlock *tb)
     static uint32_t prev_lr = 0;
     uint32_t pc = env->regs[15] | env->thumb;
     uint32_t lr = env->regs[14];
+    if (!strcmp(eos_state->model->name, "5D4") &&
+        ((pc & ~1) == 0xFE1718EE || (pc & ~1) == 0xFE1716E0))
+    {
+        fprintf(stderr, "[5D4 GUI event] pc=%08x r0=%08x r1=%08x r2=%08x r3=%08x lr=%08x task=%s\n",
+                pc, env->regs[0], env->regs[1], env->regs[2], env->regs[3], lr,
+                eos_get_current_task_name());
+    }
 
     /* for task switch, only check large PC jumps */
     if (abs((int)pc - (int)prev_pc) > 16 &&
