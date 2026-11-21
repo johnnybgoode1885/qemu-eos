@@ -37,6 +37,7 @@ static int mpu_init_spell_count = 0;
 
 #include "mpu_spells/5D2.h"
 #include "mpu_spells/5D3.h"
+#include "mpu_spells/5D4.h"
 #include "mpu_spells/6D.h"
 #include "mpu_spells/50D.h"
 #include "mpu_spells/60D.h"
@@ -455,6 +456,13 @@ unsigned int eos_handle_mpu(unsigned int parm, unsigned int address, unsigned ch
         if (eos_state->mpu.sending == 2)
         {
             /* last two chars sent, finished */
+            if (!strcmp(eos_state->model->name, "5D4") &&
+                eos_state->mpu.out_spell && eos_state->mpu.out_spell[2] == 6)
+            {
+                MPU_EPRINTF("Switch transfer complete: %02x %02x (queue %d/%d)\n",
+                    eos_state->mpu.out_spell[3], eos_state->mpu.out_spell[4],
+                    eos_state->mpu.sq_head, eos_state->mpu.sq_tail);
+            }
             eos_state->mpu.sending = 0;
         }
 
@@ -1239,6 +1247,7 @@ void mpu_spells_init(void)
     MPU_SPELL_SET_OTHER_CAM(40D, 50D)
 
     MPU_SPELL_SET_OTHER_CAM(650D, 700D)
+    MPU_SPELL_SET(5D4)
 
     if (!mpu_init_spell_count)
     {
@@ -1279,6 +1288,8 @@ void mpu_spells_init(void)
     MPU_BUTTON_CODES(50D)
     MPU_BUTTON_CODES(5D2)
     MPU_BUTTON_CODES(5D3)
+    /* Provisional: the 5D4 uses the same basic MPU switch protocol. */
+    MPU_BUTTON_CODES_OTHER_CAM(5D4, 5D3)
     MPU_BUTTON_CODES(600D)
     MPU_BUTTON_CODES(60D)
     MPU_BUTTON_CODES(6D)
