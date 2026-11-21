@@ -1,4 +1,24 @@
-This file documents changes for QEMU releases 0.12 and earlier.
+Local EOS development — unreleased — 2026-11-21
+
+  - Add experimental 5D4 firmware 1.3.3 memory mappings, RAM identification,
+    RTC/CSIO, IPC and semaphore responses, plus boot-time peripheral stubs.
+  - Add 5D4 MPU startup replay and provisional switch mappings. Battery
+    identifier bytes in the replay fixture are replaced with zeros.
+  - Display the firmware-specific 960x540 ARGB surface; handle palette,
+    rectangle, monochrome mask and ASCII text commands using FreeType.
+  - Decode tagged vector resources and render icon paths and paint references
+    with Cairo. This is partial command emulation, not a Zico CPU emulator.
+  - Latch the GUI layer during Ximr composition and provide LCD interrupts
+    so observed menu navigation does not stall or erase labels.
+  - Add GUI-event diagnostics, a snapshot-based 5D4 launcher and a Python
+    vector-to-SVG inspection tool, with build and usage documentation.
+  - Known limits: fixed text sizing, incomplete transforms, imperfect menu
+    colors, provisional joystick mapping and unavailable Live View. These
+    observations do not validate recording or physical hardware behavior.
+    The latest headless smoke run encountered a Gmt ISO assertion; it is not
+    a passing GUI boot test.
+
+The historical entries below document QEMU releases 0.12 and earlier.
 For changelog information for later releases, see
 https://wiki.qemu.org/ChangeLog or look at the git history for
 more detailed information.
