@@ -30,6 +30,8 @@
 #include "hw/eos/engine.h"
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include <cairo.h>
+#include "hw/eos/canon_vector.h"
 
 #define IGNORE_CONNECT_POLL
 
@@ -7131,6 +7133,14 @@ unsigned int eos_handle_digic6(unsigned int parm, unsigned int address, unsigned
                             static uint32_t palette[256];
                             uint32_t command[3];
                             eos_mem_read(0xBFF00500, command, sizeof(command));
+                            if (command[0] == 0x7B && command[2] == 0x2C)
+                            {
+                                uint32_t icon_packet[11];
+                                eos_mem_read(0xBFF0050C, icon_packet, sizeof(icon_packet));
+                                if (icon_packet[4] == 0x5652414D && icon_packet[8] == 960 &&
+                                    icon_packet[9] == 540 && icon_packet[5] == 0x03911D00)
+                                    eos_draw_canon_vector(icon_packet[1], icon_packet[5]);
+                            }
                             if (command[0] == 0x24 && command[2] == 0x43C)
                             {
                                 /* Ximr composition consumes the GUI layer before ARM

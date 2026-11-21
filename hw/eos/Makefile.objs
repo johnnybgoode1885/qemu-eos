@@ -6,4 +6,6 @@ obj-y += ../eos/dbi/backtrace.o
 obj-y += ../eos/scnprintf.o
 ../eos/eos.o-cflags += $(shell pkg-config --cflags freetype2)
 ../eos/eos.o-libs += $(shell pkg-config --libs freetype2)
+../eos/eos.o-cflags += $(shell pkg-config --cflags cairo)
+../eos/eos.o-libs += $(shell pkg-config --libs cairo)
 
